@@ -1,0 +1,4 @@
+# dsh-api-cost bundle patch: inserts this plugin into a profile's layer stack.
+- insert:
+    - id: api-cost
+      name: 'dsh-api-cost'

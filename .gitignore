@@ -1,0 +1,9 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Logs / temp
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
