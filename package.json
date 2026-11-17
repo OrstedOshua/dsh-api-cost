@@ -4,6 +4,9 @@
   "description": "API cost tracker for DeepSeek Harness: per-chat token cost from real API usage, configurable prices per 1M tokens (input/output/cache), currency + language selectors, and live exchange rates from a free open source.",
   "type": "module",
   "main": "lib/index.js",
+  "scripts": {
+    "test": "node --test"
+  },
   "license": "MIT",
   "keywords": [
     "dsh",
