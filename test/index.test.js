@@ -13,23 +13,32 @@ import { apply, name } from '../lib/index.js'
 const STATE_FILE = 'token-cost-state.json'
 const ROUTE = '/api/token-cost'
 
+// Clock control so daily bucketing can be exercised across calendar-day
+// boundaries without depending on the wall clock. `nowOverride` becomes the
+// value returned by Date.now for the duration of a test.
+const REAL_NOW = Date.now
+let nowOverride = null
+
 // Each test gets its own temp DSH_HOME so state is fully isolated.
 beforeEach(() => {
   const home = mkdtempSync(join(tmpdir(), 'dsh-api-cost-'))
   process.env.DSH_HOME = home
+  nowOverride = null
+  Date.now = () => (nowOverride ?? REAL_NOW())
   return home
 })
 
 afterEach(() => {
   const home = process.env.DSH_HOME
   if (home) rmSync(home, { recursive: true, force: true })
+  Date.now = REAL_NOW
 })
 
 /**
  * Build a fresh plugin instance via the real `apply()` and capture the pieces
  * a test needs: the session-event handler and the registered HTTP fetch route.
  */
-function makeApp() {
+function makeApp(extraCtx = {}) {
   const handlers = {}
   let config = null
   let fetchHandler = null
@@ -49,6 +58,7 @@ function makeApp() {
         },
       })
     },
+    ...extraCtx,
   }
   apply(ctx)
 
@@ -323,8 +333,144 @@ test('legacy state file (days format) migrates to per-day sessions', async () =>
   // The persisted file is upgraded to v3 and stores `sessions`, not `days`.
   const saved = readState()
   assert.equal(saved.version, 3)
-  assert.ok(!saved.days)
+  // Legacy day *records* migrate to sessions, so the numeric daily-aggregate
+  // map stays empty (it is only fed by addUsage during live usage events).
+  assert.deepEqual(saved.days, {})
   assert.ok(saved.sessions['day/2026-11-15'])
+})
+
+// ---------------------------------------------------------------------------
+// Chat name (name / setSessionName)
+// ---------------------------------------------------------------------------
+
+test('session has an empty name by default', async () => {
+  const app = makeApp()
+  const payload = await get(app.fetch, 's')
+  assert.equal(payload.session.name, '')
+})
+
+test('setSessionName stores and persists a trimmed name', async () => {
+  const app = makeApp()
+  const res = await post(app.fetch, { action: 'setSessionName', session: 's', name: '  My Chat  ' })
+  assert.equal(res.ok, true)
+  assert.equal(res.session.name, 'My Chat')
+
+  // name is readable through GET and persisted to disk
+  const payload = await get(app.fetch, 's')
+  assert.equal(payload.session.name, 'My Chat')
+  assert.equal(readState().sessions.s.name, 'My Chat')
+})
+
+test('setSessionName supports renaming a chat', async () => {
+  const app = makeApp()
+  await post(app.fetch, { action: 'setSessionName', session: 's', name: 'First' })
+  const res = await post(app.fetch, { action: 'setSessionName', session: 's', name: 'Second' })
+  assert.equal(res.session.name, 'Second')
+
+  const payload = await get(app.fetch, 's')
+  assert.equal(payload.session.name, 'Second')
+})
+
+test('setSessionName normalizes the name (trim + 200-char cap)', async () => {
+  const app = makeApp()
+  const long = 'x'.repeat(250)
+  const res = await post(app.fetch, { action: 'setSessionName', session: 's', name: '  ' + long + '  ' })
+  assert.equal(res.session.name, 'x'.repeat(200))
+
+  // whitespace-only input trims to empty string
+  const res2 = await post(app.fetch, { action: 'setSessionName', session: 's', name: '   ' })
+  assert.equal(res2.session.name, '')
+})
+
+test('setSessionName requires a session id', async () => {
+  const app = makeApp()
+  const res = await post(app.fetch, { action: 'setSessionName', name: 'no-session' })
+  assert.ok(res.error, 'expected a sessionRequired error')
+})
+
+// ---------------------------------------------------------------------------
+// Default title from the sessionTitle service (when name is empty)
+// ---------------------------------------------------------------------------
+
+test('GET returns title from sessionTitle when the name is empty', async () => {
+  const app = makeApp({
+    sessionTitle: { get: () => 'DSH System Title' },
+  })
+  const payload = await get(app.fetch, 's')
+  assert.equal(payload.session.name, '')
+  assert.equal(payload.session.title, 'DSH System Title')
+})
+
+test('a user-set name takes precedence over the system title', async () => {
+  const app = makeApp({
+    sessionTitle: { get: () => 'DSH System Title' },
+  })
+  await post(app.fetch, { action: 'setSessionName', session: 's', name: 'User Name' })
+  const payload = await get(app.fetch, 's')
+  assert.equal(payload.session.name, 'User Name')
+  assert.equal(payload.session.title, undefined)
+})
+
+test('no title is added when sessionTitle has no value', async () => {
+  const app = makeApp({
+    sessionTitle: { get: () => '' },
+  })
+  const payload = await get(app.fetch, 's')
+  assert.equal(payload.session.name, '')
+  assert.equal(payload.session.title, undefined)
+})
+
+// ---------------------------------------------------------------------------
+// Daily spend series (days / getDays)
+// ---------------------------------------------------------------------------
+
+test('days series starts empty', async () => {
+  const app = makeApp()
+  const payload = await get(app.fetch)
+  assert.deepEqual(payload.days, [])
+})
+
+test('usage aggregates into one descending entry per day', async () => {
+  const app = makeApp()
+  await post(app.fetch, { action: 'setPrices', prices: PRICE })
+
+  nowOverride = Date.parse('2026-11-18T10:00:00')
+  app.emit('s', { outputTokens: 2 }) // cost 2
+  app.emit('s', { outputTokens: 3 }) // cost 3 -> 5 on the same day
+  nowOverride = Date.parse('2026-11-19T10:00:00')
+  app.emit('s', { outputTokens: 4 }) // cost 4 on the next day
+
+  const payload = await get(app.fetch)
+  assert.deepEqual(payload.days, [
+    { date: '2026-11-18', costRub: 5 },
+    { date: '2026-11-19', costRub: 4 },
+  ])
+})
+
+test('usage around midnight splits into separate daily buckets', async () => {
+  const app = makeApp()
+  await post(app.fetch, { action: 'setPrices', prices: PRICE })
+
+  nowOverride = Date.parse('2026-11-18T23:59:59')
+  app.emit('s', { outputTokens: 1 }) // cost 1 on 11-18
+  nowOverride = Date.parse('2026-11-19T00:00:01')
+  app.emit('s', { outputTokens: 1 }) // cost 1 on 11-19
+
+  const payload = await get(app.fetch)
+  assert.deepEqual(payload.days, [
+    { date: '2026-11-18', costRub: 1 },
+    { date: '2026-11-19', costRub: 1 },
+  ])
+})
+
+test('GET for a single session also carries the days series', async () => {
+  const app = makeApp()
+  await post(app.fetch, { action: 'setPrices', prices: PRICE })
+  nowOverride = Date.parse('2026-11-18T12:00:00')
+  app.emit('s', { outputTokens: 2 })
+
+  const payload = await get(app.fetch, 's')
+  assert.deepEqual(payload.days, [{ date: '2026-11-18', costRub: 2 }])
 })
 
 // end of dsh-api-cost test suite
