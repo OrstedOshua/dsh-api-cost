@@ -127,6 +127,23 @@ function convertRub(amountRub, currency, rates) {
   return n
 }
 
+/** Mirror of the client's chart labelling (lib/client.js): show a date label on
+ * every `step`-th column plus the final one, so ~6 labels never collide on a
+ * 20-bar chart. Returns the column indexes that receive a label. */
+function chartLabelPositions(days) {
+  const step = Math.max(1, Math.ceil(days.length / 6))
+  const positions = []
+  for (let i = 0; i < days.length; i++) {
+    if (i % step === 0 || i === days.length - 1) positions.push(i)
+  }
+  return positions
+}
+
+/** Client-side label text: strip the leading year (YYYY-MM-DD -> MM-DD). */
+function chartLabel(dateStr) {
+  return String(dateStr).slice(5)
+}
+
 // ---------------------------------------------------------------------------
 // Exchange-rate fallback behaviour (fetchRates). We stub the global fetch so
 // the tests are deterministic and never hit the real network.
@@ -601,6 +618,153 @@ test('switching currency keeps stored RUB totals intact and supplies rates for t
   // ...and converting it with the API-served rates yields ≈1.78 USD.
   const usd = convertRub(sess.costRub, payload.currency, payload.rates)
   assert.ok(Math.abs(usd - 160 / 90) < 1e-9)
+})
+
+// ---------------------------------------------------------------------------
+// Bug fix: session title is resolved from the injected sessions/sessionTitle
+// services (systemTitle), so a chat shows a real name instead of a raw id.
+// ---------------------------------------------------------------------------
+
+test('systemTitle returns the title from the sessions projection', async () => {
+  const sessions = new Map([
+    ['chat-1', { projections: { values: () => ({ title: 'Миграция данных' }) } }],
+  ])
+  const app = makeApp({ sessions })
+  const payload = await get(app.fetch, 'chat-1')
+  assert.equal(payload.session.name, '')
+  assert.equal(payload.session.title, 'Миграция данных')
+})
+
+test('systemTitle prefers the sessionTitle service over the sessions projection', async () => {
+  const sessions = new Map([
+    ['chat-1', { projections: { values: () => ({ title: 'From projection' }) } }],
+  ])
+  const app = makeApp({
+    sessions,
+    sessionTitle: { get: () => 'From service' },
+  })
+  const payload = await get(app.fetch, 'chat-1')
+  assert.equal(payload.session.title, 'From service')
+})
+
+test('chat list shows titles resolved from injected sessions/sessionTitle', async () => {
+  const sessions = new Map([
+    ['chat-1', { projections: { values: () => ({ title: 'Проект Альфа' }) } }],
+  ])
+  const app = makeApp({ sessions })
+  await post(app.fetch, { action: 'setPrices', prices: PRICE })
+  app.emit('chat-1', { outputTokens: 2 })
+
+  const payload = await get(app.fetch)
+  const sess = payload.sessions.find((s) => s.sessionId === 'chat-1')
+  assert.ok(sess, 'chat must appear after emitting usage')
+  assert.equal(sess.name, '')
+  assert.equal(sess.title, 'Проект Альфа')
+  assert.equal(sess.sessionId, 'chat-1')
+})
+
+test('missing sessions/sessionTitle still resolve to an empty title (no crash)', async () => {
+  const app = makeApp() // no extra context
+  const payload = await get(app.fetch, 'chat-1')
+  assert.equal(payload.session.name, '')
+  assert.equal(payload.session.title, undefined)
+})
+
+// ---------------------------------------------------------------------------
+// Bug fix: cost updates in real time — the very next read after an
+// assistant/message event reflects the new spend (no reload/silent poll).
+// ---------------------------------------------------------------------------
+
+test('cost is immediately reflected after an assistant/message event', async () => {
+  const app = makeApp()
+  await post(app.fetch, { action: 'setPrices', prices: PRICE })
+
+  // Initial state: zero spend.
+  let payload = await get(app.fetch, 'chat-1')
+  assert.equal(payload.session.costRub, 0)
+  assert.equal(payload.session.outputTokens, 0)
+
+  // After the event, the very next read already carries the updated cost.
+  app.emit('chat-1', { outputTokens: 3 })
+  payload = await get(app.fetch, 'chat-1')
+  assert.equal(payload.session.costRub, 3)
+  assert.equal(payload.session.outputTokens, 3)
+
+  // A second event accumulates immediately too.
+  app.emit('chat-1', { outputTokens: 2 })
+  payload = await get(app.fetch, 'chat-1')
+  assert.equal(payload.session.costRub, 5)
+  assert.equal(payload.session.outputTokens, 5)
+})
+
+test('only assistant/message events update the live cost', async () => {
+  const app = makeApp()
+  await post(app.fetch, { action: 'setPrices', prices: PRICE })
+
+  // A non-assistant event with usage must NOT move the cost.
+  app.emit('chat-1', { outputTokens: 9 }, 'user/message')
+  let payload = await get(app.fetch, 'chat-1')
+  assert.equal(payload.session.costRub, 0)
+  assert.equal(payload.session.outputTokens, 0)
+
+  // The assistant/message event updates it.
+  app.emit('chat-1', { outputTokens: 4 })
+  payload = await get(app.fetch, 'chat-1')
+  assert.equal(payload.session.costRub, 4)
+})
+
+// ---------------------------------------------------------------------------
+// Bug fix: daily chart labels are spaced out so dates on the 20-column chart
+// do not collide — only every Nth column (plus the last) gets a label.
+// ---------------------------------------------------------------------------
+
+test('chart label step is computed so ~6 labels fit without overlap', async () => {
+  const days = lastNDays(20, 2026, 10, 19)
+  const step = Math.max(1, Math.ceil(days.length / 6))
+  assert.equal(step, 4)
+
+  // A label is shown at i%step===0 plus the final column.
+  const labelled = days.map((_, i) => i % step === 0 || i === days.length - 1)
+  const shown = labelled.filter(Boolean).length
+  assert.equal(shown, 6, 'expected exactly 6 labels on a 20-column chart')
+
+  // Labels are spaced roughly `step` apart (every Nth column), except the
+  // final column which is always labelled even when it sits just after the
+  // last regular tick. Never every column.
+  const indexes = labelled
+    .map((on, i) => (on ? i : -1))
+    .filter((i) => i >= 0)
+  assert.equal(indexes[0], 0, 'first column is always labelled')
+  for (let i = 1; i < indexes.length - 1; i++) {
+    assert.equal(indexes[i] - indexes[i - 1], step, 'regular label spacing must equal the computed step')
+  }
+  assert.equal(indexes[indexes.length - 1], days.length - 1, 'last column is always labelled')
+})
+
+test('chart labels format as MM-DD (year stripped) and read in date order', async () => {
+  const days = lastNDays(20, 2026, 10, 19)
+  const step = Math.max(1, Math.ceil(days.length / 6))
+  const labels = days
+    .map((d, i) => (i % step === 0 || i === days.length - 1 ? chartLabel(d) : null))
+    .filter(Boolean)
+
+  assert.ok(labels.length > 0)
+  for (const l of labels) {
+    assert.match(l, /^\d{2}-\d{2}$/, `label must be MM-DD, got "${l}"`)
+  }
+  // Ascending chronological order across the 20-day window.
+  const sorted = [...labels].sort()
+  assert.deepEqual(labels, sorted)
+  assert.equal(labels[0], '10-31')
+  assert.equal(labels[labels.length - 1], '11-19')
+})
+
+test('few days get labelled on every column (no sparsity needed)', async () => {
+  const days = lastNDays(5, 2026, 10, 19)
+  const step = Math.max(1, Math.ceil(days.length / 6))
+  assert.equal(step, 1)
+  const labels = days.map((d, i) => (i % step === 0 || i === days.length - 1 ? chartLabel(d) : null))
+  assert.equal(labels.filter(Boolean).length, days.length, 'every column is labelled for 5 days')
 })
 
 // end of dsh-api-cost test suite
