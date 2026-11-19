@@ -98,6 +98,36 @@ function readState() {
 const PRICE = { input: 0, output: 1_000_000, cache: 0 }
 
 // ---------------------------------------------------------------------------
+// Helpers for the 20-day chart window and the client-side currency conversion.
+// `convertRub` mirrors the documented formula in lib/client.js (a browser
+// bundle that is not imported here), so the conversion contract is testable
+// without a DOM environment.
+// ---------------------------------------------------------------------------
+
+function ymd(ts) {
+  const d = new Date(ts)
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return d.getFullYear() + '-' + m + '-' + day
+}
+
+/** The last `count` calendar-day keys (YYYY-MM-DD) ending at (y, mo, d). */
+function lastNDays(count, y, mo, d) {
+  const out = []
+  for (let i = count - 1; i >= 0; i--) out.push(ymd(new Date(y, mo, d - i)))
+  return out
+}
+
+/** Client-side RUB → selected-currency conversion (mirror of lib/client.js). */
+function convertRub(amountRub, currency, rates) {
+  const n = Number.isFinite(amountRub) && amountRub >= 0 ? amountRub : 0
+  const base = rates && Number(rates.RUB)
+  const to = rates && Number(rates[currency])
+  if (base > 0 && to > 0) return (n / base) * to
+  return n
+}
+
+// ---------------------------------------------------------------------------
 // Exchange-rate fallback behaviour (fetchRates). We stub the global fetch so
 // the tests are deterministic and never hit the real network.
 // ---------------------------------------------------------------------------
@@ -420,34 +450,86 @@ test('no title is added when sessionTitle has no value', async () => {
   assert.equal(payload.session.title, undefined)
 })
 
-// ---------------------------------------------------------------------------
-// Daily spend series (days / getDays)
-// ---------------------------------------------------------------------------
+test('chat list resolves the system title for unnamed chats', async () => {
+  const app = makeApp({
+    sessionTitle: { get: () => 'DSH System Title' },
+  })
+  await post(app.fetch, { action: 'setPrices', prices: PRICE })
+  app.emit('s', { outputTokens: 2 })
 
-test('days series starts empty', async () => {
-  const app = makeApp()
   const payload = await get(app.fetch)
-  assert.deepEqual(payload.days, [])
+  const sess = payload.sessions.find((s) => s.sessionId === 's')
+  assert.equal(sess.name, '')
+  assert.equal(sess.title, 'DSH System Title') // shown bold as the chat name
+  assert.equal(sess.sessionId, 's') // sessionId stays separate, listed small below
 })
 
-test('usage aggregates into one descending entry per day', async () => {
+test('chat list prefers an explicit user name and omits the system title', async () => {
+  const app = makeApp({
+    sessionTitle: { get: () => 'DSH System Title' },
+  })
+  await post(app.fetch, { action: 'setPrices', prices: PRICE })
+  app.emit('s', { outputTokens: 2 })
+  await post(app.fetch, { action: 'setSessionName', session: 's', name: 'My Chat' })
+
+  const payload = await get(app.fetch)
+  const sess = payload.sessions.find((s) => s.sessionId === 's')
+  assert.equal(sess.name, 'My Chat')
+  assert.equal(sess.title, undefined)
+  assert.equal(sess.sessionId, 's')
+})
+
+test('chat list shows the raw sessionId when there is no name or title', async () => {
+  const app = makeApp()
+  await post(app.fetch, { action: 'setPrices', prices: PRICE })
+  app.emit('s', { outputTokens: 2 })
+
+  const payload = await get(app.fetch)
+  const sess = payload.sessions.find((s) => s.sessionId === 's')
+  assert.equal(sess.name, '')
+  assert.equal(sess.title, undefined)
+  assert.equal(sess.sessionId, 's') // UI falls back to the id as the visible label
+})
+
+// ---------------------------------------------------------------------------
+// Daily spend series (days / getDays): always 20 columns ending today,
+// zero-filled, populated as spend accrues.
+// ---------------------------------------------------------------------------
+
+test('days series always returns 20 columns ending today, zero-filled', async () => {
+  const app = makeApp()
+  nowOverride = Date.parse('2026-11-19T12:00:00')
+  const payload = await get(app.fetch)
+  assert.equal(payload.days.length, 20)
+  assert.deepEqual(
+    payload.days.map((d) => d.date),
+    lastNDays(20, 2026, 10, 19),
+  )
+  assert.ok(payload.days.every((d) => d.costRub === 0), 'empty days are zero-filled')
+})
+
+test('daily spend fills the matching columns in the 20-day series', async () => {
   const app = makeApp()
   await post(app.fetch, { action: 'setPrices', prices: PRICE })
 
   nowOverride = Date.parse('2026-11-18T10:00:00')
-  app.emit('s', { outputTokens: 2 }) // cost 2
-  app.emit('s', { outputTokens: 3 }) // cost 3 -> 5 on the same day
+  app.emit('s', { outputTokens: 2 }) // cost 2 on 11-18
+  app.emit('s', { outputTokens: 3 }) // -> 5 on 11-18
   nowOverride = Date.parse('2026-11-19T10:00:00')
-  app.emit('s', { outputTokens: 4 }) // cost 4 on the next day
+  app.emit('s', { outputTokens: 4 }) // cost 4 on 11-19
 
   const payload = await get(app.fetch)
-  assert.deepEqual(payload.days, [
-    { date: '2026-11-18', costRub: 5 },
-    { date: '2026-11-19', costRub: 4 },
-  ])
+  assert.equal(payload.days.length, 20)
+  const byDate = Object.fromEntries(payload.days.map((d) => [d.date, d.costRub]))
+  assert.equal(byDate['2026-11-18'], 5)
+  assert.equal(byDate['2026-11-19'], 4)
+  // Columns outside the active spend window stay zero-filled (no sparse array).
+  assert.equal(byDate['2026-11-17'], 0)
+  assert.equal(byDate['2026-11-01'], 0)
+  assert.equal(byDate['2026-10-31'], 0)
 })
 
-test('usage around midnight splits into separate daily buckets', async () => {
+test('usage around midnight splits into separate daily buckets in the series', async () => {
   const app = makeApp()
   await post(app.fetch, { action: 'setPrices', prices: PRICE })
 
@@ -457,20 +539,68 @@ test('usage around midnight splits into separate daily buckets', async () => {
   app.emit('s', { outputTokens: 1 }) // cost 1 on 11-19
 
   const payload = await get(app.fetch)
-  assert.deepEqual(payload.days, [
-    { date: '2026-11-18', costRub: 1 },
-    { date: '2026-11-19', costRub: 1 },
-  ])
+  assert.equal(payload.days.length, 20)
+  const byDate = Object.fromEntries(payload.days.map((d) => [d.date, d.costRub]))
+  assert.equal(byDate['2026-11-18'], 1)
+  assert.equal(byDate['2026-11-19'], 1)
 })
 
-test('GET for a single session also carries the days series', async () => {
+test('GET for a single session also carries the 20-day series', async () => {
   const app = makeApp()
   await post(app.fetch, { action: 'setPrices', prices: PRICE })
   nowOverride = Date.parse('2026-11-18T12:00:00')
   app.emit('s', { outputTokens: 2 })
 
   const payload = await get(app.fetch, 's')
-  assert.deepEqual(payload.days, [{ date: '2026-11-18', costRub: 2 }])
+  assert.equal(payload.days.length, 20)
+  const byDate = Object.fromEntries(payload.days.map((d) => [d.date, d.costRub]))
+  assert.equal(byDate['2026-11-18'], 2)
+})
+
+// ---------------------------------------------------------------------------
+// Currency conversion (bug fix): stored costs are RUB; the UI converts them to
+// the selected currency at the live USD-base rate. 160 ₽ must become ~2 $
+// rather than being shown as 160 $.
+// ---------------------------------------------------------------------------
+
+test('convertRub converts RUB to USD at the exchange rate', () => {
+  const usd = convertRub(160, 'USD', { RUB: 90, USD: 1 })
+  assert.ok(Math.abs(usd - 160 / 90) < 1e-9, `expected ≈1.78, got ${usd}`)
+  assert.ok(usd < 160, 'converted value must not equal the raw RUB amount (bug regression)')
+})
+
+test('convertRub converts RUB to EUR and CNY at the exchange rate', () => {
+  const rates = { RUB: 90, USD: 1, EUR: 0.9, CNY: 7.2 }
+  assert.ok(Math.abs(convertRub(160, 'EUR', rates) - (160 / 90) * 0.9) < 1e-9)
+  assert.ok(Math.abs(convertRub(160, 'CNY', rates) - (160 / 90) * 7.2) < 1e-9)
+})
+
+test('convertRub falls back to the raw RUB amount without valid rates', () => {
+  assert.equal(convertRub(160, 'USD', null), 160)
+  assert.equal(convertRub(160, 'USD', { RUB: 0, USD: 1 }), 160)
+  assert.equal(convertRub(NaN, 'USD', { RUB: 90, USD: 1 }), 0)
+  assert.equal(convertRub(-5, 'USD', { RUB: 90, USD: 1 }), 0)
+})
+
+test('switching currency keeps stored RUB totals intact and supplies rates for the UI', async () => {
+  const app = makeApp()
+  await post(app.fetch, { action: 'setPrices', prices: PRICE })
+  app.emit('s', { outputTokens: 160 }) // costRub = 160
+
+  await post(app.fetch, { action: 'setCurrency', currency: 'USD' })
+  const payload = await get(app.fetch)
+
+  assert.equal(payload.currency, 'USD')
+  assert.equal(payload.rates.base, 'USD')
+  assert.equal(payload.rates.RUB, 90)
+
+  // The stored total is still 160 RUB (stored amounts are never rewritten to
+  // the display currency)...
+  const sess = payload.sessions.find((s) => s.sessionId === 's')
+  assert.equal(sess.costRub, 160)
+  // ...and converting it with the API-served rates yields ≈1.78 USD.
+  const usd = convertRub(sess.costRub, payload.currency, payload.rates)
+  assert.ok(Math.abs(usd - 160 / 90) < 1e-9)
 })
 
 // end of dsh-api-cost test suite
